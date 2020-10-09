@@ -1,64 +1,109 @@
 package myapps;
 
+import io.confluent.kafka.schemaregistry.client.SchemaRegistryClient;
+import io.confluent.kafka.schemaregistry.testutil.MockSchemaRegistry;
+import io.confluent.kafka.serializers.AbstractKafkaAvroSerDeConfig;
+import io.confluent.kafka.serializers.KafkaAvroDeserializer;
+import io.confluent.kafka.serializers.KafkaAvroSerializer;
+import io.confluent.kafka.streams.serdes.avro.GenericAvroSerde;
+import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.kafka.common.serialization.Serde;
 import org.apache.kafka.common.serialization.Serdes;
-import org.apache.kafka.common.utils.Bytes;
-import org.apache.kafka.streams.KafkaStreams;
 import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
-import org.apache.kafka.streams.Topology;
-import org.apache.kafka.streams.kstream.KeyValueMapper;
-import org.apache.kafka.streams.kstream.Materialized;
+import org.apache.kafka.streams.TestInputTopic;
+import org.apache.kafka.streams.TestOutputTopic;
+import org.apache.kafka.streams.TopologyTestDriver;
+import org.apache.kafka.streams.kstream.KStream;
 import org.apache.kafka.streams.kstream.Produced;
-import org.apache.kafka.streams.kstream.ValueMapper;
-import org.apache.kafka.streams.state.KeyValueStore;
-import java.util.Arrays;
-import java.util.Locale;
+import org.junit.Test;
+
+import java.util.Collections;
+import java.util.List;
 import java.util.Properties;
-import java.util.concurrent.CountDownLatch;
+
+import static org.hamcrest.CoreMatchers.equalTo;
+import static org.hamcrest.MatcherAssert.assertThat;
 
 /*
- * reads from a source topic, split each text line into words and 
- * then compute the word occurence histogram, write the continuous updated histogram
- * into a topic where each record is an updated count of a single word.
- * for running steps see: https://kafka.apache.org/26/documentation/streams/quickstart
+ * Sample using the Generic Avro Serializer / Deserializer (Serde)
  */
 public class Pipe {
 
-    public static void main(String[] args) throws Exception {
-        Properties props = new Properties();
-        props.put(StreamsConfig.APPLICATION_ID_CONFIG, "streams-wordcount");
-        props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "localhost:9092");
-        props.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.String().getClass());
-        props.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.String().getClass());
+  // A mocked schema registry for our serdes to use
+  private static final String SCHEMA_REGISTRY_SCOPE = GenericAvroIntegrationTest.class.getName();
+  private static final String MOCK_SCHEMA_REGISTRY_URL = "mock://" + SCHEMA_REGISTRY_SCOPE;
 
-        final StreamsBuilder builder = new StreamsBuilder();
+  private static String inputTopic = "inputTopic";
+  private static String outputTopic = "outputTopic";
 
-        builder.<String, String>stream("streams-plaintext-input")
-               .flatMapValues(value -> Arrays.asList(value.toLowerCase(Locale.getDefault()).split("\\W+")))
-               .groupBy((key, value) -> value)
-               .count(Materialized.<String, Long, KeyValueStore<Bytes, byte[]>>as("counts-store"))
-               .toStream()
-               .to("streams-wordcount-output", Produced.with(Serdes.String(), Serdes.Long()));
+  private static  List<Object> generateSampleData()
+  {
+    final GenericRecord record = new GenericData.Record(schema);
+    record.put("user", "alice");
+    record.put("is_new", true);
+    record.put("content", "lorem ipsum");
+    return Collections.singletonList(record);
+  }  
 
-        final Topology topology = builder.build();
-        final KafkaStreams streams = new KafkaStreams(topology, props);
-        final CountDownLatch latch = new CountDownLatch(1);
+  public static void main(String[] args) throws Exception {
 
-        // attach shutdown handler to catch control-c
-        Runtime.getRuntime().addShutdownHook(new Thread("streams-shutdown-hook") {
-            @Override
-            public void run() {
-                streams.close();
-                latch.countDown();
-            }
-        });
+    final Schema schema = new Schema.Parser().parse(
+      new Pipe().getClass().getResourceAsStream("/resources/sample_schema.avsc")
+    );
+    
+    final SchemaRegistryClient schemaRegistryClient = MockSchemaRegistry.getClientForScope(SCHEMA_REGISTRY_SCOPE);
+    schemaRegistryClient.register("inputTopic-value", schema);   
 
-        try {
-            streams.start();
-            latch.await();
-        } catch (Throwable e) {
-            System.exit(1);
-        }
-        System.exit(0);
+    //
+    // Step 1: Configure and start the processor topology.
+    //
+    final StreamsBuilder builder = new StreamsBuilder();
+    final Properties streamsConfiguration = new Properties();
+    streamsConfiguration.put(StreamsConfig.APPLICATION_ID_CONFIG, "generic-avro-serde");
+    streamsConfiguration.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "dummy config");
+    streamsConfiguration.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.ByteArray().getClass().getName());
+    streamsConfiguration.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, GenericAvroSerde.class);
+    streamsConfiguration.put(AbstractKafkaAvroSerDeConfig.SCHEMA_REGISTRY_URL_CONFIG, MOCK_SCHEMA_REGISTRY_URL);
+
+    final Serde<String> stringSerde = Serdes.String();
+    final Serde<GenericRecord> genericAvroSerde = new GenericAvroSerde();
+
+
+    genericAvroSerde.configure(
+      Collections.singletonMap(AbstractKafkaAvroSerDeConfig.SCHEMA_REGISTRY_URL_CONFIG, MOCK_SCHEMA_REGISTRY_URL),
+      /*isKey*/ false);
+    final KStream<String, GenericRecord> stream = builder.stream(inputTopic);
+    stream.to(outputTopic, Produced.with(stringSerde, genericAvroSerde));
+
+    try (final TopologyTestDriver topologyTestDriver = new TopologyTestDriver(builder.build(), streamsConfiguration)){
+      //
+      // Step 2: Setup input and output topics.
+      //
+      final TestInputTopic<Void, Object> input = topologyTestDriver
+        .createInputTopic(inputTopic,
+                          new IntegrationTestUtils.NothingSerde<>(),
+                          new KafkaAvroSerializer(schemaRegistryClient));
+      final TestOutputTopic<Void, Object> output = topologyTestDriver
+        .createOutputTopic(outputTopic,
+                           new IntegrationTestUtils.NothingSerde<>(),
+                           new KafkaAvroDeserializer(schemaRegistryClient));
+
+      //
+      // Step 3: Produce some input data to the input topic.
+      //
+      final List<Object> inputValues = generateSampleData();
+      input.pipeValueList(finputValues );
+
+      //
+      // Step 4: Verify the application's output data.
+      //
+      assertThat(output.readValuesToList(), equalTo(inputValues));
+    } finally {
+      MockSchemaRegistry.dropScope(SCHEMA_REGISTRY_SCOPE);
     }
+  }
+  
 }
