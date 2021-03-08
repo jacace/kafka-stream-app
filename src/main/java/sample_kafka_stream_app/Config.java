@@ -13,6 +13,8 @@ public class Config {
     public static String SaslJaasConfig;
     // public static String SslEndpointIdentificationAlgorithm;
     public static String TopicOut;
+    public static String TopicIn1;
+    public static String TopicIn2;
 
     public void load() {
         try {
